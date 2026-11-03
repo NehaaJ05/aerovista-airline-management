@@ -1,25 +1,29 @@
+
 import mysql, { Pool, PoolConnection } from 'mysql2/promise';
 import { sqlErrorResponse } from './sqlErrors';
 
 /**
- * Lazily-constructed MySQL connection pool.
- *
- * - Never throws at import time (a missing DATABASE_URL becomes a JSON 503
- *   at request time instead of an HTML crash page).
- * - dateStrings: DATETIME values come back exactly as stored
- *   ("2026-11-03 06:00:00"), so flight times are never shifted by the
- *   server's or browser's time zone.
- * - decimalNumbers: DECIMAL money columns arrive as numbers.
+ * Preserve the pool across Next.js development hot reloads.
+ * This prevents every module reload from creating another pool.
  */
-let _pool: Pool | null = null;
+const globalForMysql = globalThis as typeof globalThis & {
+  mysqlPool?: Pool;
+};
 
 export function getPool(): Pool {
-  if (_pool) return _pool;
-  const url = process.env.DATABASE_URL;
-  if (!url) {
-    throw new Error('DATABASE_URL is not set. Copy .env.example to .env.local and set DATABASE_URL.');
+  if (globalForMysql.mysqlPool) {
+    return globalForMysql.mysqlPool;
   }
-  _pool = mysql.createPool({
+
+  const url = process.env.DATABASE_URL;
+
+  if (!url) {
+    throw new Error(
+      'DATABASE_URL is not set. Copy .env.example to .env.local and set DATABASE_URL.'
+    );
+  }
+
+  const pool = mysql.createPool({
     uri: url,
     connectionLimit: 10,
     waitForConnections: true,
@@ -27,17 +31,22 @@ export function getPool(): Pool {
     dateStrings: true,
     decimalNumbers: true,
   });
-  return _pool;
+
+  globalForMysql.mysqlPool = pool;
+  return pool;
 }
 
-type DbResult<T> = { ok: true; value: T } | { ok: false; status: number; error: string };
+type DbResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; status: number; error: string };
 
 /**
- * Run fn with the pool. Database failures are converted to
- * { ok:false, status, error } — custom SIGNAL errors (MYSQL_ERRNO 5001-5010)
- * keep their message and map to a meaningful HTTP status.
+ * Run a callback using the shared pool.
+ * Database failures are converted into structured API responses.
  */
-export async function withDb<T>(fn: (pool: Pool) => Promise<T>): Promise<DbResult<T>> {
+export async function withDb<T>(
+  fn: (pool: Pool) => Promise<T>
+): Promise<DbResult<T>> {
   try {
     const pool = getPool();
     return { ok: true, value: await fn(pool) };
@@ -47,16 +56,40 @@ export async function withDb<T>(fn: (pool: Pool) => Promise<T>): Promise<DbResul
   }
 }
 
-/** Same as withDb but with one dedicated connection (needed for CALL ... OUT params). */
-export async function withConnection<T>(fn: (conn: PoolConnection) => Promise<T>): Promise<DbResult<T>> {
+/**
+ * Run a callback using one dedicated connection.
+ *
+ * Always attempt to roll back any unfinished transaction before
+ * returning the connection to the pool.
+ *
+ * Stored procedures that manage their own transactions can still
+ * COMMIT or ROLLBACK normally. A final ROLLBACK after a successful
+ * procedure call is harmless.
+ */
+export async function withConnection<T>(
+  fn: (conn: PoolConnection) => Promise<T>
+): Promise<DbResult<T>> {
   let conn: PoolConnection | null = null;
+
   try {
     conn = await getPool().getConnection();
-    return { ok: true, value: await fn(conn) };
+
+    const value = await fn(conn);
+
+    return { ok: true, value };
   } catch (e: unknown) {
     const r = sqlErrorResponse(e);
     return { ok: false, status: r.status, error: r.error };
   } finally {
-    conn?.release();
+    if (conn) {
+      try {
+        await conn.rollback();
+      } catch {
+        // Ignore rollback errors during cleanup.
+        // The connection may already have been disconnected.
+      }
+
+      conn.release();
+    }
   }
 }
